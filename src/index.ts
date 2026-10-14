@@ -11,10 +11,14 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
   Tool,
+  CallToolResult,
 } from '@modelcontextprotocol/sdk/types.js';
 import { WinUAEConnection, WinUAEConfig } from './winuae-connection.js';
 import { M68kRegisters, WatchpointType } from './gdb-protocol.js';
 import * as path from 'path';
+import { watchTools, handleWatchTool } from './watch-tools.js';
+import { inputTools, handleInputTool } from './input-tools.js';
+import { debugTools, handleDebugTool } from './debug-tools.js';
 
 // ─── Configuration from environment ──────────────────────────────────
 
@@ -256,10 +260,108 @@ function isDiskImage(filePath: string): boolean {
 // ─── Tool Definitions ────────────────────────────────────────────────
 
 const tools: Tool[] = [
+  ...debugTools,
+  ...inputTools,
+  ...watchTools,
+  ...[
+    ['winuae_attach','Attach to the configured existing GDB server. Never launch a process. Connecting stops the guest, as with ordinary GDB attach.'],
+    ['winuae_launch','Launch and own a new emulator using configured paths. Fail if already connected, owning a process, or the port is occupied.'],
+    ['winuae_detach','Detach, clear remote controls and debugger state, resume guest execution and leave the emulator running. Relinquish process ownership so MCP exit will not terminate it. Host UI pause remains unchanged.'],
+    ['winuae_shutdown','Stop only an emulator launched and still owned by this MCP server. Refuse attached or detached instances.']
+  ].map(([name,description])=>({name,description,inputSchema:{type:'object' as const,properties:{}}})),
+  {
+    name: 'winuae_wait_stop',
+    description: 'Wait for a stop without interrupting execution. Pause and disconnect remain available. Timeout leaves the CPU running.',
+    inputSchema: { type: 'object', properties: {
+      timeout_ms: { type: 'integer', minimum: 1, maximum: 60000, default: 30000 }
+    } }
+  },
+  {
+    name: 'winuae_process_breakpoint',
+    description: 'Arm a one-shot stop at an AmigaDOS program entry, or inspect/clear it. Does not launch the program. Names match case-insensitively; bare names match the basename. Continue execution after arming.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['set', 'status', 'clear'] },
+        name: { type: 'string', description: 'ASCII process or CLI command name' },
+        address: { type: ['string', 'number'], description: 'AmigaDOS Process address; alternative to name' },
+      },
+      required: ['action'],
+    },
+  },
+  {
+    name: 'winuae_loaded_segments',
+    description: 'Inspect loaded AmigaDOS segments for the current or selected Process. Returns load-order indexes, guest payload addresses and allocated sizes for relocating host hunk symbols. Corrupt or unavailable process metadata reports an error.',
+    inputSchema: {
+      type: 'object',
+      properties: { address: { type: ['string', 'number'], description: 'Optional Process address; defaults to the current task' } },
+    },
+  },
+  {
+    name: 'winuae_exceptions',
+    description: 'Select CPU exception stops and inspect the last fault snapshot. Set vectors such as 2=bus error, 3=address error, 4=illegal instruction, 5=divide by zero. Current registers are after exception-frame construction; the snapshot preserves pre-frame D0-D7,A0-A7,SR,PC and instruction_pc.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['set', 'status', 'clear'] },
+        vectors: { type: 'array', items: { type: 'integer', minimum: 2, maximum: 63 }, description: 'Complete replacement set of exception vectors' },
+      },
+      required: ['action'],
+    },
+  },
+  {
+    name: 'winuae_range_step',
+    description: 'Execute at least one instruction and stop when PC leaves [start,end), or another stop fires. Starts asynchronously; use pause to inspect the stop. Equal bounds single-step.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        start: { type: ['string', 'number'], description: 'Inclusive range start' },
+        end: { type: ['string', 'number'], description: 'Exclusive range end' },
+      },
+      required: ['start', 'end'],
+    },
+  },
+  {
+    name: 'winuae_dma_watchpoint',
+    description: 'Add, list or remove remotely owned DMA watchpoints. Filter accesses by hardware source; CPU accesses do not match. Stop replies identify the actual source and custom register.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['add', 'list', 'remove'] },
+        address: { type: ['string', 'number'] },
+        length: { type: 'integer', minimum: 1, maximum: 65536 },
+        mode: { type: 'string', enum: ['read', 'write', 'access'] },
+        sources: { type: 'array', items: { type: 'string', enum: ['blitter', 'copper', 'disk', 'audio', 'bitplane', 'sprite'] } },
+        id: { type: 'integer', minimum: 0, maximum: 19, description: 'ID returned by add, required for remove' },
+      },
+      required: ['action'],
+    },
+  },
+  {
+    name: 'winuae_guest_output',
+    description: 'Enable, disable, read or clear bounded guest diagnostics from uaelib function 86. Reads preserve records and include IDs, truncation and eviction counts. This channel does not capture AmigaDOS console or serial output.',
+    inputSchema: {
+      type: 'object',
+      properties: { action: { type: 'string', enum: ['on', 'off', 'read', 'clear'] } },
+      required: ['action'],
+    },
+  },
+  {
+    name: 'winuae_checkpoint',
+    description: 'Save or restore a WinUAE debugging checkpoint at a host path. State files are only valid at frame start, so save resumes the CPU, saves at the next frame start and stops again: the CPU ends up to one frame past the original stop. Any other stop first, such as a breakpoint, cancels the save with an error. Restore retains the connection and leaves the CPU stopped, but clears remote breakpoints, watchpoints, exception selection and captured output. External disk/file writes are not rolled back; normal WinUAE savestate limitations apply.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['save', 'restore'] },
+        file: { type: 'string', description: 'Host path to a WinUAE state file; save replaces an existing file' },
+      },
+      required: ['action', 'file'],
+    },
+  },
   // Connection tools
   {
     name: 'winuae_connect',
-    description: 'Launch WinUAE (BartmanAbyss fork) and connect to GDB RSP server. Must be called before any other WinUAE commands. Set WINUAE_PATH env var to override default path.',
+    description: 'Launch WinUAE and connect to GDB RSP server. Must be called before any other WinUAE commands. Set WINUAE_PATH env var to override default path.',
     inputSchema: {
       type: 'object',
       properties: {},
@@ -618,9 +720,138 @@ const tools: Tool[] = [
 
 // ─── Tool Implementations ────────────────────────────────────────────
 
-async function handleToolCall(name: string, args: any): Promise<{ content: Array<{ type: string; text?: string }> }> {
+async function handleToolCall(name: string, args: any): Promise<CallToolResult> {
   try {
+    if (name === 'winuae_watch') return await handleWatchTool(args, connection?.connected ? connection.getProtocol() : undefined);
+    if (inputTools.some(tool => tool.name === name))
+      return await handleInputTool(name, args, connection?.connected ? connection.getProtocol() : undefined);
+    if (debugTools.some(tool => tool.name === name)) {
+      return await handleDebugTool(name, args, connection?.connected ? connection.getProtocol() : undefined);
+    }
     switch (name) {
+      case 'winuae_wait_stop': {
+        if (!connection?.connected) throw new Error('Not connected to WinUAE');
+        return { content: [{ type: 'text', text: await connection.getProtocol().waitForStop(args.timeout_ms ?? 30000) }] };
+      }
+      case 'winuae_process_breakpoint': {
+        if (!connection?.connected) throw new Error('Not connected to WinUAE');
+        const protocol = connection.getProtocol();
+        if (args.action === 'set') {
+          if ((args.name !== undefined) === (args.address !== undefined)) {
+            throw new Error('Supply exactly one of name or address');
+          }
+          if (args.name !== undefined) {
+            if (typeof args.name !== 'string' || !/^[\x20-\x7e]{1,255}$/.test(args.name)) {
+              throw new Error('Name must contain 1-255 printable ASCII characters');
+            }
+            await protocol.sendMonitorCommand(`process-break name ${args.name}`);
+          } else {
+            const address = parseHexOrDecimal(args.address);
+            if (!Number.isInteger(address) || address <= 0 || address > 0xffffffff || address % 4) {
+              throw new Error('Process address must be a nonzero aligned 32-bit address');
+            }
+            await protocol.sendMonitorCommand(`process-break address ${address.toString(16)}`);
+          }
+        } else if (args.action === 'clear') {
+          await protocol.sendMonitorCommand('process-break clear');
+        } else if (args.action !== 'status') {
+          throw new Error('Action must be set, status or clear');
+        }
+        return { content: [{ type: 'text', text: await protocol.sendMonitorCommand('process-break status') }] };
+      }
+      case 'winuae_loaded_segments': {
+        if (!connection?.connected) throw new Error('Not connected to WinUAE');
+        let command = 'segments';
+        if (args.address !== undefined) {
+          const address = parseHexOrDecimal(args.address);
+          if (!Number.isInteger(address) || address <= 0 || address > 0xffffffff || address % 4) {
+            throw new Error('Process address must be a nonzero aligned 32-bit address');
+          }
+          command += ` ${address.toString(16)}`;
+        }
+        return { content: [{ type: 'text', text: await connection.getProtocol().sendMonitorCommand(command) }] };
+      }
+      case 'winuae_exceptions': {
+        if (!connection?.connected) throw new Error('Not connected to WinUAE');
+        const protocol = connection.getProtocol();
+        if (args.action === 'set') {
+          if (!Array.isArray(args.vectors) || args.vectors.length > 62 ||
+              args.vectors.some((v: unknown) => typeof v !== 'number' || !Number.isInteger(v) || v < 2 || v > 63)) {
+            throw new Error('Vectors must be an array of integers from 2 to 63');
+          }
+          let mask = 0n;
+          for (const vector of args.vectors) mask |= 1n << BigInt(vector);
+          await protocol.sendMonitorCommand(`exception-mask ${mask.toString(16)}`);
+        } else if (args.action === 'clear') {
+          await protocol.sendMonitorCommand('exception-mask 0');
+        } else if (args.action !== 'status') {
+          throw new Error('Action must be set, status or clear');
+        }
+        return { content: [{ type: 'text', text: await protocol.sendMonitorCommand('exception') }] };
+      }
+      case 'winuae_range_step': {
+        if (!connection?.connected) throw new Error('Not connected to WinUAE');
+        await connection.getProtocol().rangeStep(parseHexOrDecimal(args.start), parseHexOrDecimal(args.end));
+        return { content: [{ type: 'text', text: 'Range stepping started. Use pause to inspect the stop.' }] };
+      }
+      case 'winuae_dma_watchpoint': {
+        if (!connection?.connected) throw new Error('Not connected to WinUAE');
+        const protocol = connection.getProtocol();
+        if (args.action === 'add') {
+          const address = parseHexOrDecimal(args.address);
+          const length = args.length;
+          const modes: Record<string, number> = { read: 1, write: 2, access: 3 };
+          const sources: Record<string, number> = { blitter: 0x1f8, copper: 0x200, disk: 0x400, audio: 0x7800, bitplane: 0x7f8000, sprite: 0x7f800000 };
+          if (!Number.isInteger(address) || address < 0 || !Number.isInteger(length) || length < 1 ||
+              length > 65536 || address + length > 0x7fff0000 || !Object.hasOwn(modes, args.mode) ||
+              !Array.isArray(args.sources) || !args.sources.length || args.sources.length > 6 ||
+              args.sources.some((source: unknown) => typeof source !== 'string' || !Object.hasOwn(sources, source))) {
+            throw new Error('Supply a valid range, access mode and one or more DMA source groups');
+          }
+          let mask = 0;
+          for (const source of args.sources) mask |= sources[source];
+          const id = await protocol.sendMonitorCommand(`dma-watch add ${address.toString(16)} ${length.toString(16)} ${modes[args.mode]} ${mask.toString(16)}`);
+          return { content: [{ type: 'text', text: JSON.stringify({id:Number(id)}) }] };
+        }
+        if (args.action === 'remove') {
+          if (!Number.isInteger(args.id) || args.id < 0 || args.id >= 20) throw new Error('Invalid DMA watchpoint ID');
+          await protocol.sendMonitorCommand(`dma-watch remove ${args.id.toString(16)}`);
+        } else if (args.action !== 'list') {
+          throw new Error('Action must be add, list or remove');
+        }
+        return { content: [{ type: 'text', text: await protocol.sendMonitorCommand('dma-watch list') }] };
+      }
+      case 'winuae_guest_output': {
+        if (!connection?.connected) throw new Error('Not connected to WinUAE');
+        if (!['on', 'off', 'read', 'clear'].includes(args.action)) throw new Error('Action must be on, off, read or clear');
+        return { content: [{ type: 'text', text: await connection.getProtocol().sendMonitorCommand(`guest-output ${args.action}`) }] };
+      }
+      case 'winuae_checkpoint': {
+        if (!connection?.connected) throw new Error('Not connected to WinUAE');
+        if (!['save', 'restore'].includes(args.action) || typeof args.file !== 'string' ||
+            !args.file.length || /[\x00\r\n]/.test(args.file)) throw new Error('Supply save or restore and a valid host file path');
+        const { resolve } = await import('path');
+        const file = resolve(args.file);
+        if (Buffer.byteLength(file, 'utf8') > 900) throw new Error('Checkpoint path is too long');
+        const protocol = connection.getProtocol();
+        await protocol.sendMonitorCommand(`checkpoint ${args.action} ${file}`);
+        const registers = await protocol.readRegisters();
+        return { content: [{ type: 'text', text: JSON.stringify({action:args.action,file,stopped:true,registers}) }] };
+      }
+      case 'winuae_attach':
+      case 'winuae_launch': {
+        if (!connection) connection = new WinUAEConnection(config);
+        if (name === 'winuae_attach') await connection.connectExisting();
+        else await connection.connect();
+        return { content:[{type:'text',text:JSON.stringify(await connection.status())}] };
+      }
+      case 'winuae_detach':
+      case 'winuae_shutdown': {
+        if (!connection) throw new Error('No session');
+        if (name === 'winuae_detach') await connection.detach();
+        else await connection.shutdown();
+        return { content:[{type:'text',text:JSON.stringify(await connection.status())}] };
+      }
       case 'winuae_connect': {
         if (connection?.connected) {
           return { content: [{ type: 'text', text: 'Already connected to WinUAE' }] };
@@ -633,7 +864,7 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
       }
 
       case 'winuae_disconnect': {
-        if (!connection?.connected) {
+        if (!connection) {
           return { content: [{ type: 'text', text: 'Not connected to WinUAE' }] };
         }
         await connection.disconnect();
@@ -642,11 +873,8 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
       }
 
       case 'winuae_status': {
-        if (!connection?.connected) {
-          return { content: [{ type: 'text', text: 'Not connected' }] };
-        }
-        const healthy = await connection.healthCheck();
-        return { content: [{ type: 'text', text: healthy ? 'Connected and responsive' : 'Connected but not responding' }] };
+        const status = connection ? await connection.status() : {connected:false,owned:false,pid:null,responsive:false,execution:'disconnected'};
+        return { content: [{ type:'text',text:JSON.stringify(status) }] };
       }
 
       case 'winuae_load': {
@@ -685,7 +913,7 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
         if (fileData.length >= 4) {
           const magic = fileData.readUInt32BE(0);
           if (magic === 0x000003F3) {
-            console.error(`[WinUAE] Detected hunk executable: ${absPath}`);
+            throw new Error('Hunk executables require winuae_hunk_load with explicit RAM placements');
           }
         }
 
@@ -817,6 +1045,9 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
         if (toWrite.length === 0) {
           return { content: [{ type: 'text', text: 'No registers specified to write' }] };
         }
+
+        // Apply SR before A7 because changing privilege mode switches stacks.
+        toWrite.sort((a, b) => (a.idx === 16 ? -1 : b.idx === 16 ? 1 : 0));
 
         // Write one register at a time, verify each before proceeding.
         // The WinUAE GDB server needs time between register writes.
@@ -955,8 +1186,8 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
         if (!path.isAbsolute(filepath)) {
           filepath = path.join(os.tmpdir(), filepath);
         }
-        // Use Windows backslash path for the WinUAE side
-        const winPath = filepath.replace(/\//g, '\\');
+        // Use the native host path, including spaces and Unicode.
+        const winPath = filepath;
         const result = await protocol.sendMonitorCommand(`screenshot ${winPath}`);
         if (result.startsWith('OK')) {
           // result format: "OK WxH filepath"
@@ -970,7 +1201,7 @@ async function handleToolCall(name: string, args: any): Promise<{ content: Array
     }
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
-    return { content: [{ type: 'text', text: `Error: ${errorMessage}` }] };
+    return { isError: true, content: [{ type: 'text', text: `Error: ${errorMessage}` }] };
   }
 }
 
@@ -992,23 +1223,35 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools,
 }));
 
+// Keep each tool's pause/read/write sequence together on the RSP connection.
+let toolQueue: Promise<unknown> = Promise.resolve();
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
-  return handleToolCall(name, args || {});
+  // Observation sends no RSP commands and must not block a queued pause.
+  if (name === 'winuae_wait_stop') return handleToolCall(name, args || {});
+  const result = toolQueue.then(() => handleToolCall(name, args || {}));
+  toolQueue = result.catch(() => undefined);
+  return result;
 });
 
 // Handle shutdown
 process.on('SIGINT', async () => {
-  if (connection?.connected) {
+  if (connection) {
     await connection.disconnect();
   }
   process.exit(0);
 });
 
 process.on('SIGTERM', async () => {
-  if (connection?.connected) {
+  if (connection) {
     await connection.disconnect();
   }
+  process.exit(0);
+});
+
+// A closed MCP transport must not leave its emulator child running.
+process.stdin.on('end', async () => {
+  if (connection) await connection.disconnect();
   process.exit(0);
 });
 

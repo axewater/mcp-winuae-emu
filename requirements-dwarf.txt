@@ -1,0 +1,2 @@
+# Optional host-side source, variable and unwind support.
+pyelftools==0.32

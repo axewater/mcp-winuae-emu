@@ -8,9 +8,11 @@
     "mcp-winuae-emu": "dist/index.js"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && node scripts/copy-runtime.mjs",
     "watch": "tsc --watch",
-    "prepare": "npm run build"
+    "prepare": "npm run build",
+    "test": "npm run build && node scripts/test-input.mjs && node scripts/test-watch.mjs",
+    "setup:dwarf": "node scripts/setup-dwarf.mjs"
   },
   "keywords": [
     "mcp",
@@ -31,7 +33,7 @@
     "url": "https://github.com/axewater/mcp-winuae-emu.git"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.4"
+    "@modelcontextprotocol/sdk": "^1.26.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
@@ -43,6 +45,8 @@
   "files": [
     "dist",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "requirements-dwarf.txt",
+    "scripts/setup-dwarf.mjs"
   ]
 }
