@@ -11,7 +11,7 @@
     "build": "tsc && node scripts/copy-runtime.mjs",
     "watch": "tsc --watch",
     "prepare": "npm run build",
-    "test": "npm run build && node scripts/test-input.mjs && node scripts/test-watch.mjs",
+    "test": "npm run build && node scripts/test-input.mjs && node scripts/test-watch.mjs && node scripts/test-ports.mjs",
     "setup:dwarf": "node scripts/setup-dwarf.mjs"
   },
   "keywords": [

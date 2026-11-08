@@ -10,8 +10,47 @@ import * as net from 'node:net';
 export interface WinUAEConfig {
   winuaePath: string;
   configFile: string;
-  gdbPort: number;
+  /** 'auto' launches each emulator on a free port; a number names one shared port. */
+  gdbPort: number | 'auto';
 }
+
+/** Port attach uses when no fixed port is configured; launches never pick it. */
+export const DEFAULT_ATTACH_PORT = 2345;
+
+/** Parse WINUAE_GDB_PORT; invalid values are reported when a port is used. */
+export function parseGdbPort(value: string | undefined): number | 'auto' {
+  if (!value || value === 'auto') return 'auto';
+  return /^\d+$/.test(value) ? Number(value) : NaN;
+}
+
+function checkPort(port: number): number {
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error(`Invalid GDB port ${port}; use 1-65535`);
+  return port;
+}
+
+/** Check without connecting: a connection would interrupt another emulator's GDB session. */
+function portFree(port: number): Promise<boolean> {
+  return new Promise(resolve => {
+    const probe = net.createServer();
+    probe.once('error', () => resolve(false));
+    probe.listen({host:'127.0.0.1',port,exclusive:true}, () => probe.close(() => resolve(true)));
+  });
+}
+
+/** Ask the OS for an unused loopback port. Ephemeral ports never include the default attach port. */
+function freePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.once('error', reject);
+    server.listen({host:'127.0.0.1',port:0,exclusive:true}, () => {
+      const {port} = server.address() as net.AddressInfo;
+      server.close(error => error ? reject(error) : resolve(port));
+    });
+  });
+}
+
+/** WinUAE could not listen because another process bound the port first. */
+class PortTakenError extends Error {}
 
 export class WinUAEConnection {
   private config: WinUAEConfig;
@@ -19,14 +58,20 @@ export class WinUAEConnection {
   private protocol: GdbProtocol | null = null;
   private isConnected = false;
   private logFilePath: string | null = null;
+  private port: number | null = null;
+  private requestedPort: number | undefined;
   private floppies: Map<number, string> = new Map();
 
   constructor(config: WinUAEConfig) {
     this.config = config;
   }
 
-  /** Launch WinUAE without modifying the user configuration. */
-  async connect(): Promise<void> {
+  /**
+   * Launch WinUAE without modifying the user configuration. Without a fixed
+   * port, each launch gets a free port so concurrent MCP sessions never share
+   * an emulator.
+   */
+  async connect(requestedPort?: number): Promise<void> {
     if (this.connected || this.process) {
       throw new Error('Launch requires no connection or owned emulator');
     }
@@ -47,18 +92,35 @@ export class WinUAEConnection {
     if (!this.config.configFile || !fs.existsSync(this.config.configFile)) {
       throw new Error('Set WINUAE_CONFIG to an existing .uae configuration');
     }
-    if (!Number.isInteger(this.config.gdbPort) || this.config.gdbPort < 1 || this.config.gdbPort > 65535) {
-      throw new Error('Invalid WINUAE_GDB_PORT');
+
+    const fixedPort = requestedPort ?? (this.config.gdbPort === 'auto' ? undefined : this.config.gdbPort);
+    if (fixedPort !== undefined) {
+      checkPort(fixedPort);
+      // A bind failure must not launch a second child.
+      if (!await portFree(fixedPort)) {
+        throw new Error(`GDB port ${fixedPort} is already in use, possibly by another MCP session's emulator. ` +
+          (requestedPort === undefined ? 'Unset WINUAE_GDB_PORT (or set it to auto) so each launch uses a free port. '
+            : 'Launch without a port to use a free one. ') +
+          'Use winuae_attach only when the user asks to inspect an emulator that is already running.');
+      }
     }
 
-    // Check without connecting: a connection probe would interrupt another
-    // emulator's GDB session. A bind failure must not launch a second child.
-    await new Promise<void>((resolve, reject) => {
-      const probe = net.createServer();
-      probe.once('error', () => reject(new Error(`GDB port ${this.config.gdbPort} is occupied or unavailable; use attach`)));
-      probe.listen({host:'127.0.0.1',port:this.config.gdbPort,exclusive:true}, () => probe.close(error => error ? reject(error) : resolve()));
-    });
+    // Another process can bind a free port before WinUAE does; pick again.
+    for (let attempt = 0; ; attempt++) {
+      const port = fixedPort ?? await freePort();
+      try {
+        await this.launch(exePath, port);
+        this.port = port;
+        this.requestedPort = requestedPort;
+        return;
+      } catch (error) {
+        if (!(error instanceof PortTakenError) || fixedPort !== undefined || attempt >= 2) throw error;
+        console.error(`[WinUAE] ${error.message}; retrying with another port`);
+      }
+    }
+  }
 
+  private async launch(exePath: string, port: number): Promise<void> {
     // Create log file
     const logDir = path.join(os.tmpdir(), 'winuae-mcp');
     if (!fs.existsSync(logDir)) {
@@ -76,7 +138,7 @@ export class WinUAEConnection {
       '-f', path.resolve(this.config.configFile),
       '-s', 'use_gui=no',
       '-s', 'debugging_features=gdbserver',
-      '-s', `gdb_port=${this.config.gdbPort}`,
+      '-s', `gdb_port=${port}`,
       // WinUAE does not start the GDB server with the threaded CPU.
       '-s', 'cpu_threaded=false',
     ];
@@ -93,7 +155,7 @@ export class WinUAEConnection {
     }
 
     console.error(`[WinUAE] Launching ${exePath} ${args.join(' ')}`);
-    console.error(`[WinUAE] GDB port: ${this.config.gdbPort}`);
+    console.error(`[WinUAE] GDB port: ${port}`);
     console.error(`[WinUAE] Log file: ${this.logFilePath}`);
 
     this.process = spawn(exePath, args, {
@@ -120,7 +182,7 @@ export class WinUAEConnection {
 
     // Wait for GDB server to become available
     try {
-      await this.waitForGdb(child);
+      await this.waitForGdb(child, port);
     } catch (err) {
       // Close log fd and clean up if GDB connection fails after launch
       try { closeLog(); } catch {}
@@ -130,97 +192,103 @@ export class WinUAEConnection {
   }
 
   /**
-   * Connect to an already-running WinUAE instance (no process spawn)
+   * Attach to an emulator the user started (no process spawn). Without a
+   * port, use the fixed WINUAE_GDB_PORT or the conventional default.
    */
-  async connectExisting(): Promise<void> {
+  async connectExisting(requestedPort?: number): Promise<void> {
     if (this.connected) {
       throw new Error('Already connected to WinUAE');
     }
+    if (this.process) throw new Error('Attach requires no owned emulator; shut it down first');
 
-    console.error(`[WinUAE] Connecting to existing instance on port ${this.config.gdbPort}`);
+    const port = checkPort(requestedPort ?? (this.config.gdbPort === 'auto' ? DEFAULT_ATTACH_PORT : this.config.gdbPort));
+    console.error(`[WinUAE] Attaching to existing instance on port ${port}`);
     this.dropConnection();
-    if (!await this.tryQuickConnect()) throw new Error('No existing WinUAE GDB server is available; attach never launches an emulator');
-  }
-
-  /**
-   * Try to quickly connect to an existing GDB server (fast, 2 attempts).
-   * Returns true if connected, false if no server found.
-   */
-  private async tryQuickConnect(): Promise<boolean> {
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        this.protocol = new GdbProtocol();
-        await this.protocol.connect('127.0.0.1', this.config.gdbPort);
-        this.isConnected = true;
-        console.error('[WinUAE] Connected to existing GDB server');
-        return true;
-      } catch {
-        if (this.protocol) {
-          this.protocol.disconnect();
-          this.protocol = null;
-        }
-        if (attempt < 1) {
-          await new Promise(resolve => setTimeout(resolve, 300));
-        }
+    const protocol = new GdbProtocol();
+    try {
+      await protocol.connect('127.0.0.1', port);
+    } catch (error) {
+      protocol.disconnect();
+      if ((error as NodeJS.ErrnoException).code === 'ECONNREFUSED') {
+        throw new Error(`No GDB server is listening on 127.0.0.1:${port}; attach never launches an emulator. ` +
+          `Start WinUAE with debugging_features=gdbserver and gdb_port=${port}, or pass the port it uses.`);
       }
+      // WinUAE accepts one client; later connections wait unanswered in the backlog.
+      if (error instanceof Error && error.message.startsWith('GDB command timeout')) {
+        throw new Error(`The GDB server on port ${port} accepted the connection but did not answer. ` +
+          'Another debugger client, possibly another MCP session, is probably attached; WinUAE serves one client at a time. ' +
+          'Ask the user before disconnecting it.');
+      }
+      throw error;
     }
-    return false;
+    this.protocol = protocol;
+    this.isConnected = true;
+    this.port = port;
   }
 
   /**
-   * Smart connect: try existing GDB server first, then launch WinUAE if needed.
-   * Returns a status message describing what happened.
+   * Connect for a session. By default, launch a private emulator on a free
+   * port and never attach to another session's emulator. A fixed port names
+   * one shared emulator: attach when it is in use, launch otherwise.
    */
   async connectSmart(): Promise<string> {
     if (this.isConnected && !this.protocol?.connected) this.dropConnection();
     if (this.connected) {
       throw new Error('Already connected to WinUAE');
     }
-
-    // Try quick connect to an already-running instance
-    if (await this.tryQuickConnect()) {
-      return `Connected to existing WinUAE GDB server on port ${this.config.gdbPort}`;
-    }
-
     if (this.process) throw new Error('Owned emulator is not responding; use shutdown before launching again');
 
-    // No existing server -- launch WinUAE
-    console.error('[WinUAE] No existing GDB server found, launching WinUAE...');
+    if (this.config.gdbPort !== 'auto' && !await portFree(checkPort(this.config.gdbPort))) {
+      await this.connectExisting();
+      return `Connected to existing WinUAE GDB server on port ${this.port}`;
+    }
+
     await this.connect();
-    return `Launched WinUAE and connected to GDB server on port ${this.config.gdbPort}`;
+    return `Launched WinUAE and connected to GDB server on port ${this.port}`;
   }
 
   /**
-   * Wait for GDB server with retry logic
+   * Wait for the launched emulator's GDB server. WinUAE logs whether it could
+   * listen; connecting before that could reach another emulator that holds
+   * the port. Builds that log elsewhere are polled after a grace period.
    */
-  private async waitForGdb(child: ChildProcess): Promise<void> {
+  private async waitForGdb(child: ChildProcess, port: number): Promise<void> {
     const maxAttempts = 30;
     const delayMs = 500;
+    const silentAttempts = 10;
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       if (child.exitCode !== null || child.signalCode !== null) {
         throw new Error(`WinUAE exited (${child.exitCode ?? child.signalCode}) before its GDB server started; see ${this.logFilePath}`);
       }
-      try {
-        this.protocol = new GdbProtocol();
-        await this.protocol.connect('127.0.0.1', this.config.gdbPort);
+      let log = '';
+      try { log = fs.readFileSync(this.logFilePath!, 'latin1'); } catch {}
+      if (log.includes(`WinUAE GDB: cannot listen on 127.0.0.1:${port}`)) {
+        await this.cleanup();
+        throw new PortTakenError(`GDB port ${port} was taken before WinUAE could listen on it`);
+      }
+      if (log.includes(`WinUAE GDB: listening on 127.0.0.1:${port}`) || attempt >= silentAttempts) {
+        try {
+          this.protocol = new GdbProtocol();
+          await this.protocol.connect('127.0.0.1', port);
 
-        this.isConnected = true;
-        console.error('[WinUAE] Connected to GDB server');
-        return;
-      } catch (err) {
-        if (this.protocol) {
-          this.protocol.disconnect();
-          this.protocol = null;
+          this.isConnected = true;
+          console.error('[WinUAE] Connected to GDB server');
+          return;
+        } catch (err) {
+          if (this.protocol) {
+            this.protocol.disconnect();
+            this.protocol = null;
+          }
         }
+      }
 
-        if (attempt < maxAttempts - 1) {
-          await new Promise(resolve => setTimeout(resolve, delayMs));
-        }
+      if (attempt < maxAttempts - 1) {
+        await new Promise(resolve => setTimeout(resolve, delayMs));
       }
     }
 
-    throw new Error(`WinUAE GDB server on port ${this.config.gdbPort} did not start within ${maxAttempts * delayMs / 1000} seconds; see ${this.logFilePath}. ` +
+    throw new Error(`WinUAE GDB server on port ${port} did not start within ${maxAttempts * delayMs / 1000} seconds; see ${this.logFilePath}. ` +
       'On Windows, each new WinUAE beta build first shows a disclaimer dialog that must be dismissed by hand.');
   }
 
@@ -233,8 +301,8 @@ export class WinUAEConnection {
     }
     console.error('[WinUAE] Restarting with updated configuration...');
     await this.cleanup();
-    await this.connect();
-    return `Restarted WinUAE and connected to GDB server on port ${this.config.gdbPort}`;
+    await this.connect(this.requestedPort);
+    return `Restarted WinUAE and connected to GDB server on port ${this.port}`;
   }
 
   /**
@@ -251,6 +319,7 @@ export class WinUAEConnection {
 
   private dropConnection(): void {
     this.isConnected = false;
+    this.port = null;
     this.protocol?.disconnect();
     this.protocol = null;
   }
@@ -271,7 +340,7 @@ export class WinUAEConnection {
   }
 
   async status() {
-    const session = { connected:this.connected, owned:!!this.process, pid:this.process?.pid ?? null };
+    const session = { connected:this.connected, owned:!!this.process, pid:this.process?.pid ?? null, port:this.connected ? this.port : null };
     if (!this.connected) return { ...session, responsive:false, execution:'disconnected' };
     try {
       const target = JSON.parse(await this.getProtocol().sendMonitorCommand('execution-status', true));

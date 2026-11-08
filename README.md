@@ -85,7 +85,7 @@ command-line overrides. It does not modify the configuration file.
 |---|---|---|
 | `WINUAE_PATH` | `C:\apps\winuae` | Executable, executable directory, or macOS app bundle |
 | `WINUAE_CONFIG` | `<WINUAE_PATH>\Configurations\A500-Dev.uae` | Path to your `.uae` config file |
-| `WINUAE_GDB_PORT` | `2345` | GDB server TCP port |
+| `WINUAE_GDB_PORT` | `auto` | GDB port: `auto` picks a free port per launch; a number fixes one shared port |
 | `WINUAE_DEBUG` | `0` | Set to `1` to enable GDB protocol debug logging |
 | `WINUAE_PYTHON` | `.venv-dwarf` | Python with `pyelftools` for the DWARF tools |
 
@@ -99,9 +99,9 @@ The defaults follow the Windows layout. On macOS and Linux, and when
 
 | Tool | Description |
 |---|---|
-| `winuae_connect` | Attach to a running WinUAE, or launch one and connect |
-| `winuae_attach` | Attach to a running WinUAE only |
-| `winuae_launch` | Launch an owned WinUAE and connect |
+| `winuae_connect` | Launch a private WinUAE on a free port and connect |
+| `winuae_attach` | Attach to a WinUAE the user started (optional `port`) |
+| `winuae_launch` | Launch an owned WinUAE and connect (optional `port`) |
 | `winuae_detach` | Release debugger state and leave the emulator running |
 | `winuae_shutdown` | Stop an emulator launched by this server |
 | `winuae_disconnect` | Disconnect; stop only an emulator launched by this server |
@@ -199,15 +199,18 @@ The defaults follow the Windows layout. On macOS and Linux, and when
 
 ## How it works
 
-1. **Connect**: Try an existing server on `127.0.0.1` at the configured port
-   (2345 by default).
-2. **Launch**: If needed, launch WinUAE with `-f <config>`, `-s use_gui=no`,
+1. **Port**: By default each launch asks the OS for a free loopback port, so
+   concurrent MCP sessions (for example several agents) each own a separate
+   emulator. A numeric `WINUAE_GDB_PORT` instead names one shared port.
+2. **Launch**: Launch WinUAE with `-f <config>`, `-s use_gui=no`,
    `-s debugging_features=gdbserver`, `-s gdb_port=<port>` and
    `-s cpu_threaded=false`, because WinUAE does not start its GDB server with
    the threaded CPU. Windows launch overrides also disable focus/minimize
    pause for the owned process. If WinUAE exits or the server does not start,
    the error names the launch log in the `winuae-mcp` temporary directory;
-   the 10 most recent logs are kept.
+   the 10 most recent logs are kept. The server connects only after WinUAE
+   logs that it listens on the chosen port; if another process bound the port
+   first, an automatic launch retries with a new port.
 3. **Debug**: Use GDB RSP for registers, memory, breakpoints and execution
    control, and GDB `monitor` commands for the WinUAE-specific tools.
    Guest-state operations pause execution first. Tool calls are serialized so
@@ -232,10 +235,18 @@ The defaults follow the Windows layout. On macOS and Linux, and when
 
 ### Session lifecycle
 
-`winuae_attach` connects only to an existing listener; GDB attach stops the
-CPU. `winuae_launch` starts an owned emulator and rejects an occupied port
-before spawning. `winuae_connect` attaches when a server is listening and
-launches otherwise. None of these commands changes the user's configuration file.
+`winuae_connect` and `winuae_launch` start an owned emulator on a free port by
+default and never attach to another session's emulator. With a fixed
+`WINUAE_GDB_PORT`, `winuae_connect` attaches when that port is in use and
+launches otherwise, and `winuae_launch` rejects an occupied port before
+spawning. None of these commands changes the user's configuration file.
+
+`winuae_attach` connects only to an existing listener, for inspecting an
+emulator the user started: start WinUAE with `debugging_features=gdbserver`
+and `gdb_port=<port>`, then attach with that `port` (default: a fixed
+`WINUAE_GDB_PORT`, else 2345). Automatic launches never use 2345. GDB attach
+stops the CPU. WinUAE serves one debugger client at a time; attaching to a
+port that already has a client reports the conflict.
 
 `winuae_detach` releases remote input and debugger state, resumes the guest
 (unless host-paused), and relinquishes process ownership. The emulator then

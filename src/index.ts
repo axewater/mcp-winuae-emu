@@ -13,7 +13,8 @@ import {
   Tool,
   CallToolResult,
 } from '@modelcontextprotocol/sdk/types.js';
-import { WinUAEConnection, WinUAEConfig } from './winuae-connection.js';
+import { WinUAEConnection, WinUAEConfig, parseGdbPort, DEFAULT_ATTACH_PORT } from './winuae-connection.js';
+import { integer } from './debug-validation.js';
 import { M68kRegisters, WatchpointType } from './gdb-protocol.js';
 import * as path from 'path';
 import { watchTools, handleWatchTool } from './watch-tools.js';
@@ -29,7 +30,7 @@ const config: WinUAEConfig = {
     'Configurations',
     'A500-Dev.uae'
   ),
-  gdbPort: parseInt(process.env.WINUAE_GDB_PORT || '2345', 10),
+  gdbPort: parseGdbPort(process.env.WINUAE_GDB_PORT),
 };
 
 // Global connection instance
@@ -263,9 +264,21 @@ const tools: Tool[] = [
   ...debugTools,
   ...inputTools,
   ...watchTools,
+  {
+    name: 'winuae_attach',
+    description: `Attach to an emulator the user started. Use only when the user asks to inspect an already-running WinUAE. Never launches a process. Port defaults to a fixed WINUAE_GDB_PORT, else ${DEFAULT_ATTACH_PORT}. Connecting stops the guest, as with ordinary GDB attach. WinUAE serves one debugger client at a time.`,
+    inputSchema: { type: 'object', properties: {
+      port: { type: 'integer', minimum: 1, maximum: 65535, description: 'GDB port of the running emulator' }
+    } }
+  },
+  {
+    name: 'winuae_launch',
+    description: 'Launch and own a private emulator using configured paths. Without a port, uses a fixed WINUAE_GDB_PORT or, by default, a free port chosen per launch. Fail if already connected, owning a process, or a fixed port is occupied.',
+    inputSchema: { type: 'object', properties: {
+      port: { type: 'integer', minimum: 1, maximum: 65535, description: 'Fixed GDB port; omit to use a free port' }
+    } }
+  },
   ...[
-    ['winuae_attach','Attach to the configured existing GDB server. Never launch a process. Connecting stops the guest, as with ordinary GDB attach.'],
-    ['winuae_launch','Launch and own a new emulator using configured paths. Fail if already connected, owning a process, or the port is occupied.'],
     ['winuae_detach','Detach, clear remote controls and debugger state, resume guest execution and leave the emulator running. Relinquish process ownership so MCP exit will not terminate it. Host UI pause remains unchanged.'],
     ['winuae_shutdown','Stop only an emulator launched and still owned by this MCP server. Refuse attached or detached instances.']
   ].map(([name,description])=>({name,description,inputSchema:{type:'object' as const,properties:{}}})),
@@ -361,7 +374,7 @@ const tools: Tool[] = [
   // Connection tools
   {
     name: 'winuae_connect',
-    description: 'Launch WinUAE and connect to GDB RSP server. Must be called before any other WinUAE commands. Set WINUAE_PATH env var to override default path.',
+    description: 'Start a session before other WinUAE commands. By default, launch a private emulator on a free GDB port; never attach to another session\'s emulator. With a fixed WINUAE_GDB_PORT, attach when that port is in use and launch otherwise.',
     inputSchema: {
       type: 'object',
       properties: {},
@@ -841,8 +854,9 @@ async function handleToolCall(name: string, args: any): Promise<CallToolResult> 
       case 'winuae_attach':
       case 'winuae_launch': {
         if (!connection) connection = new WinUAEConnection(config);
-        if (name === 'winuae_attach') await connection.connectExisting();
-        else await connection.connect();
+        const port = args.port === undefined ? undefined : integer(args.port, 'port', 65535, 1);
+        if (name === 'winuae_attach') await connection.connectExisting(port);
+        else await connection.connect(port);
         return { content:[{type:'text',text:JSON.stringify(await connection.status())}] };
       }
       case 'winuae_detach':
@@ -1216,6 +1230,10 @@ const server = new Server(
     capabilities: {
       tools: {},
     },
+    instructions: 'Each MCP session owns a private WinUAE emulator on its own GDB port; start it with winuae_connect or winuae_launch. ' +
+      'Use winuae_attach only when the user asks to inspect an emulator that is already running. ' +
+      'Never talk to a WinUAE GDB port directly with shell tools, gdb or scripts: WinUAE serves one debugger client at a time, ' +
+      'and a direct connection interrupts or blocks the session that owns it. Report port conflicts to the user instead of working around them.',
   }
 );
 
@@ -1262,7 +1280,7 @@ async function main() {
   console.error('[MCP WinUAE] Server running');
   console.error(`[MCP WinUAE] WinUAE path: ${config.winuaePath}`);
   console.error(`[MCP WinUAE] Config file: ${config.configFile}`);
-  console.error(`[MCP WinUAE] GDB port: ${config.gdbPort}`);
+  console.error(`[MCP WinUAE] GDB port: ${config.gdbPort === 'auto' ? 'free port per launch' : config.gdbPort}`);
 }
 
 main().catch((error) => {
